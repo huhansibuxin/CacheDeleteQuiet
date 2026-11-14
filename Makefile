@@ -1,4 +1,4 @@
-# CacheDeleteQuiet v1.0.1 - in-process estimation filter for
+# CacheDeleteQuiet v1.1.0 - PLAN D auth-GOT rebind of the recursive C scan in
 #   CacheDeleteAppContainerCaches (rootless + roothide)
 # THEOS_PACKAGE_SCHEME is overridden by CI per matrix job; the ?= below is
 # only the local default (never use '=' here).
@@ -14,9 +14,10 @@ CacheDeleteQuiet_FILES = Tweak.xm
 
 # ZERO substrate/ellekit LINK dependency. This is a launchd XPC helper: a
 # dylib referencing libellekit can fail to dlopen silently (proven on
-# keybagd / aggregated). We use only __attribute__((constructor)) plus
-# objc/runtime class_replaceMethod - never %hook / MSHookFunction - so
-# dead-stripping is safe. No Foundation / UIKit / sqlite link either.
+# keybagd / aggregated). We use only __attribute__((constructor)),
+# objc/runtime class_replaceMethod, mach vm_protect and ptrauth builtins -
+# no Logos, no inline-patch API. No Foundation / UIKit / sqlite link either.
+# arm64e is REQUIRED: the plan-D rebind relies on __ptrauth.h builtins.
 CacheDeleteQuiet_LDFLAGS = -Wl,-dead_strip_dylibs
 CacheDeleteQuiet_CFLAGS = -Os -fno-objc-arc
 ERROR_ON_WARNINGS = 0
