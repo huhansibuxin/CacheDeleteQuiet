@@ -1,6 +1,14 @@
-// CacheDeleteQuiet v1.1.0 - PLAN D: in-process C-level rebind of the recursive
+// CacheDeleteQuiet v1.1.1 - PLAN D: in-process C-level rebind of the recursive
 //                            container scan, arm64e / rootless+roothide
 // =============================================================================
+// v1.1.0 device result (23:46:25, PID 32590): injection OK, but
+//   CBASE mh=0x10044c000 slide=0x10044C000   <-- slide == mh, image 0 was NOT
+//   REBIND [0..2] MISS raw=0x0 (not code)        the helper main executable
+//   REBIND READY bound=0/3 (short-circuit=YES)  <-- misleading, nothing bound
+//   23:46:32 htop 99% for ~30 s, fs_usage again all tmp/trash getattrlistbulk.
+// => Fix: locate the main image by name + dladdr cross-check, derive slot
+//    addresses from its real LC_SEGMENT_64 layout, and dump the whole dyld
+//    image table / segment table / slot neighbourhood into the log.
 // WHY v1.1.0 (v1.0.0 -> v1.0.1 both FAILED to lower CPU, proven on device)
 //   v1.0.1 full log, 22:55:01 and 23:18:13 (PID 31798 / 32491):
 //     START / DIAG / all 5 "HOOK ... OK" / READY / ONE 0ms factory call.
@@ -86,6 +94,7 @@
 #import <mach/machine.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <dlfcn.h>
 
 #if __has_include(<ptrauth.h>)
 #import <ptrauth.h>
@@ -96,7 +105,7 @@
 
 // Kept alive so CI can assert the exact build that was packaged.
 static const char kBuildTag[] __attribute__((used)) =
-    "CacheDeleteQuiet 1.1.0 QUIET plan-D auth-got-rebind no-substrate";
+    "CacheDeleteQuiet 1.1.1 QUIET plan-D auth-got-rebind no-substrate";
 
 #define kFlagDir        "/var/mobile/Documents/CacheDeleteQuiet"
 #define kFlagOff        kFlagDir "/DISABLED"
@@ -293,27 +302,105 @@ static int cdq_verify_discriminator(void *signedPtr, void *slotAddr,
 }
 #endif
 
-static int cdq_install_c_hooks(void) {
+// v1.1.0 BUG: _dyld_get_image_header(0) is NOT reliably the helper executable
+// under roothide/ElleKit (an injected dylib can own index 0). On device the
+// three slots all read raw=0x0 -> bound=0/3 -> zero CPU effect, while the
+// log still said "short-circuit=YES". v1.1.1 locates the main image by NAME
+// (and cross-checks with dladdr on a method IMP that lives in it), then uses
+// its real load-command segment layout instead of a hard-coded assumption.
+static const struct mach_header_64 *cdq_locate_image(IMP mainSym,
+                                                      uint8_t **baseOut) {
+    uint32_t n = _dyld_image_count();
+    const struct mach_header_64 *byName = NULL, *byExec = NULL, *byAddr = NULL;
+    plog("IMG count=%u\n", n);
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i);
+        const struct mach_header_64 *h =
+            (const struct mach_header_64 *)_dyld_get_image_header(i);
+        intptr_t sl = (intptr_t)_dyld_get_image_vmaddr_slide(i);
+        int hot = nm && strstr(nm, "CacheDeleteAppContainerCaches");
+        if (i < 14 || hot)
+            plog("IMG [%u] mh=%p slide=0x%lX %s\n", i, (void *)h,
+                 (unsigned long)sl, nm ? nm : "?");
+        if (hot) byName = h;
+        if (h && h->magic == MH_MAGIC_64 && h->filetype == MH_EXECUTE && !byExec)
+            byExec = h;
+    }
+    if (mainSym) {
+        Dl_info di;
+        void *sym = (void *)mainSym;
+#if CDQ_PTRAUTH
+        sym = ptrauth_strip(sym, ptrauth_key_asia);
+#endif
+        memset(&di, 0, sizeof(di));
+        if (dladdr(sym, &di) && di.dli_fbase) {
+            byAddr = (const struct mach_header_64 *)di.dli_fbase;
+            plog("IMG dladdr base=%p fname=%s sym=%s\n", di.dli_fbase,
+                 di.dli_fname ? di.dli_fname : "?",
+                 di.dli_sname ? di.dli_sname : "?");
+        } else {
+            plog("IMG dladdr MISS sym=%p\n", sym);
+        }
+    }
+    const struct mach_header_64 *mh = byName ? byName : (byAddr ? byAddr : byExec);
+    plog("IMG PICK byName=%p byDladdr=%p byExec=%p -> %p\n",
+         (void *)byName, (void *)byAddr, (void *)byExec, (void *)mh);
+    *baseOut = (uint8_t *)mh;
+    return mh;
+}
+
+static int cdq_seg_layout(const struct mach_header_64 *mh,
+                          uint64_t *textVm, uint64_t *dcVm, uint64_t *dcFile) {
+    *textVm = 0; *dcVm = 0; *dcFile = 0;
+    const uint8_t *p = (const uint8_t *)mh + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmdsize < 8) break;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *sg = (const void *)p;
+            if (!strncmp(sg->segname, "__TEXT", 6)) *textVm = sg->vmaddr;
+            else if (!strncmp(sg->segname, "__DATA_CONST", 12)) {
+                *dcVm = sg->vmaddr; *dcFile = sg->fileoff;
+            }
+        }
+        p += lc->cmdsize;
+    }
+    plog("SEG textVm=0x%llX dcVm=0x%llX dcFile=0x%llX\n",
+         (unsigned long long)*textVm, (unsigned long long)*dcVm,
+         (unsigned long long)*dcFile);
+    return *textVm && *dcVm;
+}
+
+static int cdq_install_c_hooks(IMP mainSym) {
 #if !CDQ_PTRAUTH
     plog("REBIND MISS ptrauth.h unavailable (not an arm64e build)\n");
     return 0;
 #else
-    const struct mach_header_64 *mh =
-        (const struct mach_header_64 *)_dyld_get_image_header(0);
+    uint8_t *base = NULL;
+    const struct mach_header_64 *mh = cdq_locate_image(mainSym, &base);
     if (!mh || mh->magic != MH_MAGIC_64 || mh->cputype != CPU_TYPE_ARM64) {
         plog("REBIND MISS bad main image header\n");
         return 0;
     }
-    uint8_t *base = (uint8_t *)mh;
-    intptr_t slide = _dyld_get_image_vmaddr_slide(0);
+    uint64_t textVm = 0, dcVm = 0, dcFile = 0;
+    int haveSeg = cdq_seg_layout(mh, &textVm, &dcVm, &dcFile);
+    uint64_t segDelta = haveSeg ? (dcVm - textVm) : 0x14000ULL;
+    uint64_t dcFileOff = haveSeg ? dcFile : 0x14000ULL;
     long pagesize = sysconf(_SC_PAGESIZE);
     if (pagesize <= 0) pagesize = 16384;
-    plog("CBASE mh=%p slide=0x%lX pagesize=%ld target=CacheDeleteAppContainerCaches\n",
-         (void *)mh, (unsigned long)slide, pagesize);
+    plog("CBASE mh=%p segDelta=0x%llX dcFile=0x%llX pagesize=%ld target=CacheDeleteAppContainerCaches\n",
+         (void *)mh, (unsigned long long)segDelta,
+         (unsigned long long)dcFileOff, pagesize);
 
     int ok = 0;
     for (int i = 0; i < CSLOT_COUNT; i++) {
-        void **slot = (void **)(base + kCSlots[i].slotOff);
+        uint64_t slotDelta = segDelta + (kCSlots[i].slotOff - dcFileOff);
+        void **slot = (void **)(base + slotDelta);
+        uint64_t *q = (uint64_t *)slot;
+        plog("SLOT [%d] %-24s addr=%p delta=0x%llX nb=[%016llX %016llX %016llX]\n",
+             i, kCSlots[i].name, (void *)slot, (unsigned long long)slotDelta,
+             (unsigned long long)q[-1], (unsigned long long)q[0],
+             (unsigned long long)q[1]);
         void *signedPtr = *slot;
         void *stripped = ptrauth_strip(signedPtr, ptrauth_key_asia);
         uintptr_t addr = (uintptr_t)stripped;
@@ -483,7 +570,7 @@ __attribute__((constructor)) static void cdq_init(void) {
     else if (flag_exists("PASSTHROUGH_ALL")) g_mode = MODE_PASS;
 
     open_log();
-    plog("START %llu build=1.1.0 plan=D mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
+    plog("START %llu build=1.1.1 plan=D mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
          "log=%s errno=[%d,%d,%d,%d] logfd=%d\n",
          now_ms(), g_mode, (int)getpid(), (int)getuid(), g_logpath,
          g_openErrno[0], g_openErrno[1], g_openErrno[2], g_openErrno[3], g_logfd);
@@ -553,7 +640,7 @@ __attribute__((constructor)) static void cdq_init(void) {
     if (g_mode == MODE_PASS) {
         plog("REBIND SKIPPED mode=PASSTHROUGH_ALL (stock C behaviour)\n");
     } else {
-        (void)cdq_install_c_hooks();
+        (void)cdq_install_c_hooks(g_origPrune);
     }
 
     plog("READY mode=%d enumEnc=%s log=%s (ObjC hooks are evidence-only, C rebind does the work)\n",
