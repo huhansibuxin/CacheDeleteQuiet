@@ -1,0 +1,9 @@
+Package: com.huhansibuxin.cachedeletequiet
+Name: CacheDeleteQuiet
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Stops CacheDeleteAppContainerCaches from burning 80-99% CPU on full-disk purgeable estimation, without disabling the daemon (disabling it breaks app launches). In-process only: short-circuits LSApplicationWorkspace enumerateBundlesOfType:block: for the estimation path, so no app-container enumeration / recursive stat / sorting runs. Real PURGE, periodic cleanup and tmp pruning pass through untouched; the XPC service and all replies stay well-formed, just reporting a tiny purgeable amount. Includes timing log for A/B verification. Flags in /var/mobile/Documents/CacheDeleteQuiet/: PROBE_ONLY (100% passthrough), STRICT (experimental), PASSTHROUGH_ALL, DISABLED; touch then kickstart -k. No substrate/ellekit/Foundation link, no timers, no polling.
+Maintainer: huhansibuxin
+Author: huhansibuxin
+Section: Tweaks
+Depends: ellekit
