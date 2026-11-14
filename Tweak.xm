@@ -1,4 +1,11 @@
-// CacheDeleteQuiet v1.0.0 - QUIET (diagnostic + filter), arm64e / rootless+roothide
+// CacheDeleteQuiet v1.0.1 - QUIET (diagnostic + filter), arm64e / rootless+roothide
+// v1.0.1: logger rewritten to the PowerlogProbe v0.9.0 method. v1.0.0 used a
+//   single hard-coded /var/mobile/Documents/CacheDeleteQuiet/quiet.log; this
+//   launchd XPC helper is sandboxed and could not create that directory, so
+//   g_logfd stayed -1 and EVERY plog() was a silent no-op. The hooks were
+//   installed but there was no evidence at all. Now we try several writable
+//   candidates in order (incl. /var/tmp and $TMPDIR) and record the errno of
+//   each failed one in the START line.
 // =============================================================================
 // Target process : CacheDeleteAppContainerCaches
 //   /System/Library/CacheDelete/CacheDeleteAppContainerCaches (96 KB helper)
@@ -53,8 +60,15 @@
 //                                    (EXPERIMENTAL, may return nil)
 //   PASSTHROUGH_ALL     pass       - all hooks inert, stock behaviour
 //   DISABLED            off        - no hooks installed at all
-//   Log: /var/mobile/Documents/CacheDeleteQuiet/quiet.log
-//   From SSH this is /rootfs/private/var/mobile/Documents/CacheDeleteQuiet/quiet.log
+//   Log (v1.0.1, PowerlogProbe-style fallback - first writable one wins):
+//     /var/mobile/Documents/CacheDeleteQuiet/quiet.log
+//     /var/mobile/Library/Logs/CacheDeleteQuiet.log
+//     /var/tmp/CacheDeleteQuiet.log
+//     /private/var/tmp/CacheDeleteQuiet.log
+//   From SSH prepend /rootfs/private, e.g.
+//     /rootfs/private/var/tmp/CacheDeleteQuiet.log
+//   The START line always prints the path that actually opened, plus errno
+//   for every candidate that failed. Flags may be dropped in ANY of those dirs.
 //
 // HARD CONSTRAINTS (same discipline as PowerlogProbe 1.3.0 RELEASE)
 //   - ZERO Logos %hook / ZERO substrate / ZERO ellekit LINK dependency.
@@ -77,24 +91,44 @@
 #import <stdio.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <errno.h>
+#import <time.h>
 #import <sys/stat.h>
 #import <sys/time.h>
 
-#define kDir            "/var/mobile/Documents/CacheDeleteQuiet"
-#define kLog            kDir "/quiet.log"
-#define kFlagOff        kDir "/DISABLED"
-#define kFlagPass       kDir "/PASSTHROUGH_ALL"
-#define kFlagProbe      kDir "/PROBE_ONLY"
-#define kFlagStrict     kDir "/STRICT"
+// PowerlogProbe v0.9.0 proved this ordering works on a sandboxed launchd
+// daemon: try several candidates, ignore mkdir failure, take the first fd
+// that opens. /var/tmp is world-writable and is the reliable fallback.
+#define kFlagDir        "/var/mobile/Documents/CacheDeleteQuiet"
+#define kFlagOff        kFlagDir "/DISABLED"
+#define kFlagPass       kFlagDir "/PASSTHROUGH_ALL"
+#define kFlagProbe      kFlagDir "/PROBE_ONLY"
+#define kFlagStrict     kFlagDir "/STRICT"
+
+static const char *kLogCandidates[] = {
+    "/var/mobile/Documents/CacheDeleteQuiet/quiet.log",
+    "/var/mobile/Library/Logs/CacheDeleteQuiet.log",
+    "/var/tmp/CacheDeleteQuiet.log",
+    "/private/var/tmp/CacheDeleteQuiet.log",
+};
+static const char *kLogDirs[] = {
+    "/var/mobile/Documents/CacheDeleteQuiet",
+    "/var/mobile/Library/Logs",
+    "/var/tmp",
+    "/private/var/tmp",
+};
+#define kCandCount (sizeof(kLogCandidates) / sizeof(kLogCandidates[0]))
 
 // Kept alive so CI can assert the exact build that was packaged.
 static const char kBuildTag[] __attribute__((used)) =
-    "CacheDeleteQuiet 1.0.0 QUIET diag+filter no-substrate";
+    "CacheDeleteQuiet 1.0.1 QUIET diag+filter no-substrate fallback-log";
 
 enum { MODE_OFF = 0, MODE_QUIET = 1, MODE_PROBE = 2, MODE_STRICT = 3, MODE_PASS = 4 };
 
 static int g_mode = MODE_QUIET;
 static int g_logfd = -1;
+static const char *g_logpath = "(none)";
+static int g_openErrno[4] = {0, 0, 0, 0};
 static unsigned long long g_seq = 0;
 static const char *g_enumEnc = "-";
 
@@ -118,14 +152,59 @@ static unsigned long long now_ms(void) {
     return (unsigned long long)tv.tv_sec * 1000ULL + (unsigned long long)(tv.tv_usec / 1000);
 }
 
+// PowerlogProbe v0.9.0 method: open(2)/write(2) only, no stdio buffering,
+// with a real timestamp so spikes can be matched against htop samples.
 static void plog(const char *fmt, ...) {
     if (g_logfd < 0) return;
-    char buf[512];
+    char body[1024];
     va_list ap;
     va_start(ap, fmt);
-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    int n = vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
-    if (n > 0) (void)write(g_logfd, buf, (size_t)(n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1));
+    if (n <= 0) return;
+    if (n > (int)sizeof(body) - 1) n = (int)sizeof(body) - 1;
+
+    time_t now = time(NULL);
+    struct tm tm;
+    localtime_r(&now, &tm);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%F %T", &tm);
+
+    char line[1152];
+    int m = snprintf(line, sizeof(line), "[%s] %.*s\n", ts, n, body);
+    if (m <= 0) return;
+    if (m > (int)sizeof(line) - 1) m = (int)sizeof(line) - 1;
+    (void)write(g_logfd, line, (size_t)m);
+}
+
+static char g_dynLog[512];
+
+static void open_log(void) {
+    // Sandboxed launchd helpers normally get a private TMPDIR that is ALWAYS
+    // writable even when /var/mobile/Documents and /var/tmp are blocked.
+    // Try it first, then the PowerlogProbe candidate list.
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && *tmp) {
+        int n = snprintf(g_dynLog, sizeof(g_dynLog), "%s/CacheDeleteQuiet.log", tmp);
+        if (n > 0 && n < (int)sizeof(g_dynLog)) {
+            int fd = open(g_dynLog, O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd >= 0) {
+                g_logfd = fd;
+                g_logpath = g_dynLog;
+                return;
+            }
+        }
+    }
+    for (size_t i = 0; i < kCandCount; i++) {
+        (void)mkdir(kLogDirs[i], 0755);
+        int fd = open(kLogCandidates[i], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            g_logfd = fd;
+            g_logpath = kLogCandidates[i];
+            return;
+        }
+        g_openErrno[i] = errno;
+    }
 }
 
 static void log_call(const char *name, unsigned long long t0, int pass, const char *cls) {
@@ -136,9 +215,33 @@ static void log_call(const char *name, unsigned long long t0, int pass, const ch
          pass ? "PASS" : "SKIP", dt, cls ? cls : "-");
 }
 
-static int flag_exists(const char *p) {
-    struct stat st;
-    return stat(p, &st) == 0;
+// A flag may be dropped in any of the writable dirs; check all of them so
+// mode switches keep working even when Documents is sandbox-blocked.
+static int flag_exists(const char *name) {
+    static const char *dirs[] = {
+        "/var/mobile/Documents/CacheDeleteQuiet",
+        "/var/mobile/Library/Logs",
+        "/var/tmp",
+        "/private/var/tmp",
+    };
+    const char *tmp = getenv("TMPDIR");
+    if (tmp && *tmp) {
+        char p[512];
+        int n = snprintf(p, sizeof(p), "%s/%s", tmp, name);
+        if (n > 0 && n < (int)sizeof(p)) {
+            struct stat st;
+            if (stat(p, &st) == 0) return 1;
+        }
+    }
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char p[256];
+        int n = snprintf(p, sizeof(p), "%s/%s", dirs[i], name);
+        if (n > 0 && n < (int)sizeof(p)) {
+            struct stat st;
+            if (stat(p, &st) == 0) return 1;
+        }
+    }
+    return 0;
 }
 
 // ---- find the one class in this process that implements a selector --------
@@ -254,17 +357,26 @@ static id hk_prune(id self, SEL _cmd) {
 
 // ---- ctor -----------------------------------------------------------------
 __attribute__((constructor)) static void cdq_init(void) {
-    if (flag_exists(kFlagOff)) return;                     // no hooks at all
+    if (flag_exists("DISABLED")) return;                  // no hooks at all
 
     g_mode = MODE_QUIET;
-    if (flag_exists(kFlagProbe))       g_mode = MODE_PROBE;
-    else if (flag_exists(kFlagStrict)) g_mode = MODE_STRICT;
-    else if (flag_exists(kFlagPass))   g_mode = MODE_PASS;
+    if (flag_exists("PROBE_ONLY"))       g_mode = MODE_PROBE;
+    else if (flag_exists("STRICT"))      g_mode = MODE_STRICT;
+    else if (flag_exists("PASSTHROUGH_ALL")) g_mode = MODE_PASS;
 
-    (void)mkdir(kDir, 0755);
-    g_logfd = open(kLog, O_WRONLY | O_CREAT | O_APPEND, 0644);
-    plog("START %llu build=1.0.0 mode=%d pid=%d proc=CacheDeleteAppContainerCaches\n",
-         now_ms(), g_mode, (int)getpid());
+    open_log();
+    plog("START %llu build=1.0.1 mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches log=%s "
+         "errno=[%d,%d,%d,%d] logfd=%d\n",
+         now_ms(), g_mode, (int)getpid(), (int)getuid(), g_logpath,
+         g_openErrno[0], g_openErrno[1], g_openErrno[2], g_openErrno[3], g_logfd);
+
+    // Runtime inventory: distinguishes "dylib not injected" (no START at all)
+    // from "class not loaded" / "selector does not exist".
+    int ncls = objc_getClassList(NULL, 0);
+    plog("DIAG classes=%d lsClass=%p cdcClass=%p tmpdir=%s\n",
+         ncls, (void *)objc_getClass("LSApplicationWorkspace"),
+         (void *)objc_getClass("CacheDeleteManagedAssets"),
+         getenv("TMPDIR") ? getenv("TMPDIR") : "(null)");
 
     char cls[128];
     const char *enc = "-";
@@ -273,20 +385,40 @@ __attribute__((constructor)) static void cdq_init(void) {
     // The single most important hook: full-disk app enumeration.
     // Only touch LSApplicationWorkspace in THIS process; the Filter plist
     // guarantees no other process ever loads this dylib.
-    Class ls = objc_getClass("LSApplicationWorkspace");
     SEL selEnum = sel_registerName("enumerateBundlesOfType:block:");
-    if (ls) {
-        Method m = class_getInstanceMethod(ls, selEnum);
-        if (m) {
-            g_origEnum = method_getImplementation(m);
-            g_enumEnc = method_getTypeEncoding(m);
-            enc = g_enumEnc ? g_enumEnc : "-";
-            class_replaceMethod(ls, selEnum, (IMP)hk_enum, g_enumEnc);
-            ok = 1;
-            plog("HOOK enum OK cls=LSApplicationWorkspace enc=%s\n", enc);
+    char enumCls[128] = "-";
+    Class ls = objc_getClass("LSApplicationWorkspace");
+    Method m = ls ? class_getInstanceMethod(ls, selEnum) : NULL;
+    if (m) {
+        strncpy(enumCls, "LSApplicationWorkspace", sizeof(enumCls) - 1);
+    } else {
+        // Do not assume the owner class: scan every loaded class (incl. meta)
+        // for an implementation of this selector. A category / subclass would
+        // otherwise leave the single most important hook silently unhooked.
+        int is_meta = 0;
+        Class owner = find_owner(selEnum, &is_meta);
+        if (owner) {
+            Method om = is_meta ? class_getClassMethod(owner, selEnum)
+                                : class_getInstanceMethod(owner, selEnum);
+            if (om) {
+                ls = is_meta ? object_getClass((id)owner) : owner;
+                m = om;
+                const char *nm = class_getName(owner);
+                strncpy(enumCls, nm ? nm : "?", sizeof(enumCls) - 1);
+                enumCls[sizeof(enumCls) - 1] = 0;
+            }
         }
     }
-    if (!ok) plog("HOOK enum MISS cls=LSApplicationWorkspace\n");
+    if (ls && m) {
+        g_origEnum = method_getImplementation(m);
+        g_enumEnc = method_getTypeEncoding(m);
+        enc = g_enumEnc ? g_enumEnc : "-";
+        class_replaceMethod(ls, selEnum, (IMP)hk_enum, g_enumEnc);
+        ok = 1;
+        plog("HOOK enum OK cls=%s enc=%s origIMP=%p\n",
+             enumCls, enc, (void *)g_origEnum);
+    }
+    if (!ok) plog("HOOK enum MISS (no LSApplicationWorkspace impl found) enc=-\n");
 
     cls[0] = 0; enc = "-";
     ok = install_hook(sel_registerName("cacheDeleteManagedAssetsWithInfo:atUrgency:"),
@@ -308,5 +440,5 @@ __attribute__((constructor)) static void cdq_init(void) {
                       (IMP)hk_prune, &g_origPrune, &enc, cls, sizeof(cls));
     plog("HOOK prune %s cls=%s enc=%s\n", ok ? "OK" : "MISS", cls, enc);
 
-    plog("READY mode=%d enumEnc=%s log=%s\n", g_mode, g_enumEnc ? g_enumEnc : "-", kLog);
+    plog("READY mode=%d enumEnc=%s log=%s\n", g_mode, g_enumEnc ? g_enumEnc : "-", g_logpath);
 }

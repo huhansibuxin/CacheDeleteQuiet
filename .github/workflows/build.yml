@@ -93,7 +93,7 @@ jobs:
           DYLIB=$(find .theos -name 'CacheDeleteQuiet.dylib' -type f -not -path '*.dSYM*' | head -1)
           STRINGS=$(strings -a "$DYLIB")
           for NEEDLE in \
-            'CacheDeleteQuiet 1.0.0 QUIET' \
+            'CacheDeleteQuiet 1.0.1 QUIET' \
             'enumerateBundlesOfType:block:' \
             'cacheDeleteManagedAssetsWithInfo:atUrgency:' \
             'purgeAssets:testObject:' \

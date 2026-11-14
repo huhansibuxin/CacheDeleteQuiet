@@ -1,4 +1,4 @@
-# CacheDeleteQuiet v1.0.0 - in-process estimation filter for
+# CacheDeleteQuiet v1.0.1 - in-process estimation filter for
 #   CacheDeleteAppContainerCaches (rootless + roothide)
 # THEOS_PACKAGE_SCHEME is overridden by CI per matrix job; the ?= below is
 # only the local default (never use '=' here).
