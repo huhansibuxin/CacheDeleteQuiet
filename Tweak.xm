@@ -357,7 +357,8 @@ static int cdq_seg_layout(const struct mach_header_64 *mh,
         const struct load_command *lc = (const struct load_command *)p;
         if (lc->cmdsize < 8) break;
         if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64 *sg = (const void *)p;
+            const struct segment_command_64 *sg =
+                (const struct segment_command_64 *)p;
             if (!strncmp(sg->segname, "__TEXT", 6)) *textVm = sg->vmaddr;
             else if (!strncmp(sg->segname, "__DATA_CONST", 12)) {
                 *dcVm = sg->vmaddr; *dcFile = sg->fileoff;
