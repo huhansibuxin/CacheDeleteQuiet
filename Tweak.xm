@@ -1,4 +1,4 @@
-// CacheDeleteQuiet v1.1.1 - PLAN D: in-process C-level rebind of the recursive
+// CacheDeleteQuiet v1.2.0 - PLAN D3: in-process rebind of the WHOLE framework-API
 //                            container scan, arm64e / rootless+roothide
 // =============================================================================
 // v1.1.0 device result (23:46:25, PID 32590): injection OK, but
@@ -105,7 +105,7 @@
 
 // Kept alive so CI can assert the exact build that was packaged.
 static const char kBuildTag[] __attribute__((used)) =
-    "CacheDeleteQuiet 1.1.1 QUIET plan-D auth-got-rebind no-substrate";
+    "CacheDeleteQuiet 1.2.0 QUIET plan-D3 auth-got-rebind no-substrate";
 
 #define kFlagDir        "/var/mobile/Documents/CacheDeleteQuiet"
 #define kFlagOff        kFlagDir "/DISABLED"
@@ -225,16 +225,31 @@ static int flag_exists(const char *name) {
 
 // Offsets are from the main image base (__DATA_CONST starts at +0x14000).
 // Verified against reports/helper_fixups.txt (offline chained-fixups dump).
+// __auth_got in this binary is a DENSE ordinal array: slot = __DATA_CONST + 8*ord.
+// Ordinals taken from the chained-fixups bind list (reports/helper_fixups.txt);
+// the whole table is within __DATA_CONST 0x14000..0x14430.
+enum { A_SIZE0 = 0,  // QUIET: return 0 (callers branch on zero) - size/traverse family
+       A_TIMED = 1,  // always pass through, log duration when slow (diagnosis)
+       A_COUNT = 2   // always pass through, count only
+     };
+
 typedef struct {
     const char *name;
     uint64_t    slotOff;
-    int         skip;      // 1 = QUIET short-circuits this call
+    int         action;
 } CSlot;
 
 static const CSlot kCSlots[] = {
-    { "_fast_size_directory", 0x14148, 1 },
-    { "_traverse_directory",  0x14418, 1 },
-    { "_statfs",              0x143D8, 0 },
+    { "_CacheDeleteCopyItemizedPurgeableSpaceWithInfo", 0x14018, A_TIMED },
+    { "_CacheManagementEnumerateAssets",                0x14038, A_TIMED },
+    { "_CacheManagementRemove",                         0x14040, A_TIMED },
+    { "_fast_size_directory",                           0x14148, A_SIZE0 },
+    { "_fetchAllPersonas",                              0x14168, A_TIMED },
+    { "_gatherLargeAppInfo",                            0x141A0, A_TIMED },
+    { "_recentlyUsedAppsDictionary",                    0x14390, A_TIMED },
+    { "_statfs",                                        0x143D8, A_COUNT },
+    { "_traverse_dir_with_state",                       0x14410, A_SIZE0 },
+    { "_traverse_directory",                            0x14418, A_SIZE0 },
 };
 #define CSLOT_COUNT ((int)(sizeof(kCSlots) / sizeof(kCSlots[0])))
 
@@ -247,19 +262,26 @@ static unsigned long long g_skips[CSLOT_COUNT];
 static int g_bound[CSLOT_COUNT];
 
 static int cdq_should_skip(int idx) {
-    return (g_mode == MODE_QUIET || g_mode == MODE_STRICT) && kCSlots[idx].skip;
+    return (g_mode == MODE_QUIET || g_mode == MODE_STRICT) &&
+           kCSlots[idx].action == A_SIZE0;
 }
 
 static void cdq_cstat(int idx, unsigned long long n) {
     if (n == 0) {
-        plog("CSTAT first-hit %-26s mode=%d bound=%d skipRule=%d t=%llu\n",
-             kCSlots[idx].name, g_mode, g_bound[idx], kCSlots[idx].skip, now_ms());
+        plog("CSTAT first-hit %-26s mode=%d bound=%d action=%d t=%llu\n",
+             kCSlots[idx].name, g_mode, g_bound[idx],
+             kCSlots[idx].action, now_ms());
     } else if ((n & 0x1FFULL) == 0) {
         plog("CSTAT %-26s hits=%llu skips=%llu mode=%d t=%llu\n",
              kCSlots[idx].name, (unsigned long long)(n + 1),
              (unsigned long long)g_skips[idx], g_mode, now_ms());
     }
 }
+
+// v1.2.0: every framework API the helper imports is rebound and TIMED, so one
+// restart names the call that burns the 30 s. Only the size/traverse family is
+// short-circuited; management (real purge) / statfs are pure pass-through.
+#define CDQ_SLOW_MS 30
 
 #define CDQ_WRAPPER(NAME, IDX)                                                   \
 static uint64_t NAME(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,       \
@@ -271,15 +293,34 @@ static uint64_t NAME(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,       \
         return 0;                                                               \
     }                                                                           \
     fn_gen f = (fn_gen)g_origC[IDX];                                            \
-    return f ? f(a0, a1, a2, a3, a4, a5, a6, a7) : 0;                           \
+    if (!f) return 0;                                                           \
+    unsigned long long t0 = now_ms();                                           \
+    uint64_t r = f(a0, a1, a2, a3, a4, a5, a6, a7);                             \
+    unsigned long long d = now_ms() - t0;                                       \
+    if (kCSlots[IDX].action == A_TIMED && d >= CDQ_SLOW_MS) {                   \
+        plog("CTIME %-28s ms=%llu hits=%llu ret=0x%llX t=%llu\n",               \
+             kCSlots[IDX].name, d, n + 1, (unsigned long long)r, now_ms());      \
+    }                                                                           \
+    return r;                                                                   \
 }
 
-CDQ_WRAPPER(cdq_wrap_fast_size, 0)
-CDQ_WRAPPER(cdq_wrap_traverse,  1)
-CDQ_WRAPPER(cdq_wrap_statfs,    2)
+CDQ_WRAPPER(cdq_wrap_itemized,   0)
+CDQ_WRAPPER(cdq_wrap_enumassets, 1)
+CDQ_WRAPPER(cdq_wrap_cmremove,   2)
+CDQ_WRAPPER(cdq_wrap_fast_size,  3)
+CDQ_WRAPPER(cdq_wrap_personas,   4)
+CDQ_WRAPPER(cdq_wrap_largeapp,   5)
+CDQ_WRAPPER(cdq_wrap_recentapp,  6)
+CDQ_WRAPPER(cdq_wrap_statfs,     7)
+CDQ_WRAPPER(cdq_wrap_travstate,  8)
+CDQ_WRAPPER(cdq_wrap_traverse,   9)
 
 static void *cdq_wrappers[CSLOT_COUNT] = {
-    (void *)cdq_wrap_fast_size, (void *)cdq_wrap_traverse, (void *)cdq_wrap_statfs,
+    (void *)cdq_wrap_itemized,  (void *)cdq_wrap_enumassets,
+    (void *)cdq_wrap_cmremove,  (void *)cdq_wrap_fast_size,
+    (void *)cdq_wrap_personas,  (void *)cdq_wrap_largeapp,
+    (void *)cdq_wrap_recentapp, (void *)cdq_wrap_statfs,
+    (void *)cdq_wrap_travstate, (void *)cdq_wrap_traverse,
 };
 
 #if CDQ_PTRAUTH
@@ -448,14 +489,15 @@ static int cdq_install_c_hooks(IMP mainSym) {
         (void)vm_protect(mach_task_self(), page, (vm_size_t)pagesize,
                          0, VM_PROT_READ);
 
-        plog("REBIND [%d] %-26s OK slot=%p orig=0x%llX wrap=%p disc=%d(0x%llX) skip=%d\n",
+        plog("REBIND [%d] %-26s OK slot=%p orig=0x%llX wrap=%p disc=%d(0x%llX) action=%d\n",
              i, kCSlots[i].name, (void *)slot, (unsigned long long)addr,
              cdq_wrappers[i], which, (unsigned long long)disc,
-             kCSlots[i].skip);
+             kCSlots[i].action);
         ok++;
     }
     plog("REBIND READY bound=%d/%d mode=%d (short-circuit=%s) "
-         "untouched=_CacheManagementEnumerateAssets,_CacheManagementRemove,_statfs\n",
+         "size0=_fast_size_directory,_traverse_directory,_traverse_dir_with_state "
+         "timed=framework-API passthrough (real PURGE kept)\n",
          ok, CSLOT_COUNT, g_mode,
          (g_mode == MODE_QUIET || g_mode == MODE_STRICT) ? "YES" : "NO");
     return ok;
@@ -571,7 +613,7 @@ __attribute__((constructor)) static void cdq_init(void) {
     else if (flag_exists("PASSTHROUGH_ALL")) g_mode = MODE_PASS;
 
     open_log();
-    plog("START %llu build=1.1.1 plan=D mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
+    plog("START %llu build=1.2.0 plan=D3 mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
          "log=%s errno=[%d,%d,%d,%d] logfd=%d\n",
          now_ms(), g_mode, (int)getpid(), (int)getuid(), g_logpath,
          g_openErrno[0], g_openErrno[1], g_openErrno[2], g_openErrno[3], g_logfd);

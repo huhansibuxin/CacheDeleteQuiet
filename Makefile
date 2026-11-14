@@ -1,4 +1,4 @@
-# CacheDeleteQuiet v1.1.1 - PLAN D auth-GOT rebind of the recursive C scan in
+# CacheDeleteQuiet v1.2.0 - PLAN D3 auth-GOT rebind of the whole framework-API set in
 #   CacheDeleteAppContainerCaches (rootless + roothide)
 # THEOS_PACKAGE_SCHEME is overridden by CI per matrix job; the ?= below is
 # only the local default (never use '=' here).
