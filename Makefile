@@ -1,4 +1,4 @@
-# CacheDeleteQuiet v1.2.0 - PLAN D3 auth-GOT rebind of the whole framework-API set in
+# CacheDeleteQuiet v1.3.0 - PLAN D4 auth-GOT rebind, PAC-safe orig calls, crash breaker
 #   CacheDeleteAppContainerCaches (rootless + roothide)
 # THEOS_PACKAGE_SCHEME is overridden by CI per matrix job; the ?= below is
 # only the local default (never use '=' here).

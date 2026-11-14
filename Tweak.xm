@@ -1,5 +1,31 @@
-// CacheDeleteQuiet v1.2.0 - PLAN D3: in-process rebind of the WHOLE framework-API
-//                            container scan, arm64e / rootless+roothide
+// CacheDeleteQuiet v1.3.0 - PLAN D4: crash-free rebind + per-API kill switches
+//                            arm64e / rootless+roothide
+// =============================================================================
+// v1.2.0 CRASH ROOT CAUSE (two IPS, 2026-11-15 00:12:06 / 00:15:53, both
+// EXC_BAD_ACCESS SIGSEGV "possible pointer authentication failure", stack:
+//   queue cache_delete.listener... -> servicePurgeable:info:replyBlock:
+//   -> helper -> cdq_wrap_enumassets -> blraaz)
+//   We stored the ORIGINAL function as a plain stripped pointer:
+//       g_origC[i] = ptrauth_strip(*slot, ptrauth_key_asia);   // <-- BUG
+//   arm64e C function-pointer calls are AUTHENTICATED. Disassembly of the
+//   shipped v1.2.0 wrapper proves clang emitted
+//       0x634c: blraaz x8          ; IA key, ZERO modifier
+//   A stripped (unsigned) pointer fails that authentication, so the branch
+//   target becomes the raw sig|addr value and the process dies on the first
+//   purgeable request after every restart:
+//       IPS#1 fault 0x0c620001_02d42278   IPS#2 fault 0xe8e58001_0473a278
+//       (both are <dylib_base>+0x6278 = wrapper entry, plus garbage PAC bits)
+//   FIX: store ptrauth_sign_unauthenticated(stripped, ptrauth_key_asia, 0)
+//   so it matches the blraaz/modifier-0 convention the compiler emits, and
+//   prove it with a pure-numeric re-auth round-trip before installing.
+//   Plus: reject any slot whose stripped target is one of OUR OWN wrappers
+//   (a re-entered ctor would otherwise make g_origC[i] point at ourselves).
+//   Plus: a rapid-restart breaker - three+ starts within 5 min means we are
+//   crash-looping, so the process drops ALL timed wrappers (keep only the
+//   never-calls-orig size/traverse skips) and can never crash again.
+//   Plus: per-API kill switches (SKIP_ENUM / SKIP_ITEMIZED / SKIP_PERSONAS /
+//   SKIP_LARGEAPP / SKIP_RECENTAPP flag files) so the next device round can
+//   short-circuit the API named by CTIME without rebuilding.
 // =============================================================================
 // v1.1.0 device result (23:46:25, PID 32590): injection OK, but
 //   CBASE mh=0x10044c000 slide=0x10044C000   <-- slide == mh, image 0 was NOT
@@ -105,13 +131,22 @@
 
 // Kept alive so CI can assert the exact build that was packaged.
 static const char kBuildTag[] __attribute__((used)) =
-    "CacheDeleteQuiet 1.2.0 QUIET plan-D3 auth-got-rebind no-substrate";
+    "CacheDeleteQuiet 1.3.0 QUIET plan-D4 auth-got-rebind pac-call-fixed";
 
 #define kFlagDir        "/var/mobile/Documents/CacheDeleteQuiet"
 #define kFlagOff        kFlagDir "/DISABLED"
 #define kFlagPass       kFlagDir "/PASSTHROUGH_ALL"
 #define kFlagProbe      kFlagDir "/PROBE_ONLY"
 #define kFlagStrict     kFlagDir "/STRICT"
+// v1.3.0: per-API kill switches (see kCSlots[].flag)
+#define kFlagSkipEnum     "SKIP_ENUM"
+#define kFlagSkipItemized "SKIP_ITEMIZED"
+#define kFlagSkipPersonas "SKIP_PERSONAS"
+#define kFlagSkipLargeApp "SKIP_LARGEAPP"
+#define kFlagSkipRecent   "SKIP_RECENTAPP"
+
+// v1.3.0 rapid-restart breaker state (plain epoch seconds, one per line)
+#define kStatePath      "/private/var/tmp/CacheDeleteQuiet.state"
 
 static const char *kLogCandidates[] = {
     "/var/mobile/Documents/CacheDeleteQuiet/quiet.log",
@@ -237,19 +272,20 @@ typedef struct {
     const char *name;
     uint64_t    slotOff;
     int         action;
+    const char *flag;   // v1.3.0 kill switch (NULL = none)
 } CSlot;
 
 static const CSlot kCSlots[] = {
-    { "_CacheDeleteCopyItemizedPurgeableSpaceWithInfo", 0x14018, A_TIMED },
-    { "_CacheManagementEnumerateAssets",                0x14038, A_TIMED },
-    { "_CacheManagementRemove",                         0x14040, A_TIMED },
-    { "_fast_size_directory",                           0x14148, A_SIZE0 },
-    { "_fetchAllPersonas",                              0x14168, A_TIMED },
-    { "_gatherLargeAppInfo",                            0x141A0, A_TIMED },
-    { "_recentlyUsedAppsDictionary",                    0x14390, A_TIMED },
-    { "_statfs",                                        0x143D8, A_COUNT },
-    { "_traverse_dir_with_state",                       0x14410, A_SIZE0 },
-    { "_traverse_directory",                            0x14418, A_SIZE0 },
+    { "_CacheDeleteCopyItemizedPurgeableSpaceWithInfo", 0x14018, A_TIMED, kFlagSkipItemized },
+    { "_CacheManagementEnumerateAssets",                0x14038, A_TIMED, kFlagSkipEnum     },
+    { "_CacheManagementRemove",                         0x14040, A_TIMED, NULL              },
+    { "_fast_size_directory",                           0x14148, A_SIZE0, NULL              },
+    { "_fetchAllPersonas",                              0x14168, A_TIMED, kFlagSkipPersonas },
+    { "_gatherLargeAppInfo",                            0x141A0, A_TIMED, kFlagSkipLargeApp },
+    { "_recentlyUsedAppsDictionary",                    0x14390, A_TIMED, kFlagSkipRecent   },
+    { "_statfs",                                        0x143D8, A_COUNT, NULL              },
+    { "_traverse_dir_with_state",                       0x14410, A_SIZE0, NULL              },
+    { "_traverse_directory",                            0x14418, A_SIZE0, NULL              },
 };
 #define CSLOT_COUNT ((int)(sizeof(kCSlots) / sizeof(kCSlots[0])))
 
@@ -260,10 +296,49 @@ static void *g_origC[CSLOT_COUNT];
 static unsigned long long g_hits[CSLOT_COUNT];
 static unsigned long long g_skips[CSLOT_COUNT];
 static int g_bound[CSLOT_COUNT];
+static int g_skipFlag[CSLOT_COUNT];
+static int g_guardTimedOff = 0;
 
 static int cdq_should_skip(int idx) {
+    if (g_skipFlag[idx]) return 1;
     return (g_mode == MODE_QUIET || g_mode == MODE_STRICT) &&
            kCSlots[idx].action == A_SIZE0;
+}
+
+// v1.3.0: 4 starts inside 5 minutes == crash loop. We then refuse to install
+// ANY wrapper that calls back into the framework, so the helper cannot die
+// here again. Delete /private/var/tmp/CacheDeleteQuiet.state to re-arm.
+static int cdq_guard_rapid_restart(void) {
+    time_t now = time(NULL);
+    char buf[256];
+    int n = 0;
+    int fd = open(kStatePath, O_RDONLY);
+    if (fd >= 0) {
+        n = (int)read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n < 0) n = 0;
+    }
+    buf[n] = 0;
+    int recent = 0, total = 0;
+    const char *p = buf;
+    while (*p && total < 32) {
+        while (*p && (*p < '0' || *p > '9')) p++;
+        if (!*p) break;
+        long long v = 0;
+        while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+        total++;
+        if (now - (time_t)v <= 300) recent++;
+    }
+    int flags = O_WRONLY | O_CREAT | O_APPEND;
+    if (total >= 16) flags |= O_TRUNC;
+    fd = open(kStatePath, flags, 0600);
+    if (fd >= 0) {
+        char line[32];
+        int m = snprintf(line, sizeof(line), "%lld\n", (long long)now);
+        if (m > 0) (void)write(fd, line, (size_t)m);
+        close(fd);
+    }
+    return recent >= 3;
 }
 
 static void cdq_cstat(int idx, unsigned long long n) {
@@ -281,6 +356,10 @@ static void cdq_cstat(int idx, unsigned long long n) {
 // v1.2.0: every framework API the helper imports is rebound and TIMED, so one
 // restart names the call that burns the 30 s. Only the size/traverse family is
 // short-circuited; management (real purge) / statfs are pure pass-through.
+// v1.3.0 CRITICAL: g_origC[IDX] must hold a PAC-signed pointer (key IA,
+// modifier 0), because `f(a0..a7)` through a function-pointer type compiles to
+// `blraaz x8` (authenticated, zero modifier). A stripped pointer crashes there
+// - that was the v1.2.0 crash loop.
 #define CDQ_SLOW_MS 30
 
 #define CDQ_WRAPPER(NAME, IDX)                                                   \
@@ -436,6 +515,11 @@ static int cdq_install_c_hooks(IMP mainSym) {
 
     int ok = 0;
     for (int i = 0; i < CSLOT_COUNT; i++) {
+        if (g_guardTimedOff && kCSlots[i].action != A_SIZE0) {
+            plog("REBIND [%d] %-24s SKIP guard=rapid-restart (no orig call)\n",
+                 i, kCSlots[i].name);
+            continue;
+        }
         uint64_t slotDelta = segDelta + (kCSlots[i].slotOff - dcFileOff);
         void **slot = (void **)(base + slotDelta);
         uint64_t *q = (uint64_t *)slot;
@@ -456,6 +540,20 @@ static int cdq_install_c_hooks(IMP mainSym) {
             continue;
         }
 
+        // v1.3.0: never let a slot point back at us. If the ctor somehow ran
+        // twice, *slot is already our signed wrapper; storing that in g_origC
+        // would make the wrapper call itself (and blraaz on a stripped copy of
+        // it is exactly the v1.2.0 crash signature).
+        int selfRef = 0;
+        for (int j = 0; j < CSLOT_COUNT; j++) {
+            if (addr == (uintptr_t)cdq_wrappers[j]) { selfRef = 1; break; }
+        }
+        if (selfRef) {
+            plog("REBIND [%d] %-26s SKIP already-ours stripped=0x%llX (double ctor)\n",
+                 i, kCSlots[i].name, (unsigned long long)addr);
+            continue;
+        }
+
         uint64_t disc = 0;
         int which = cdq_verify_discriminator(signedPtr, (void *)slot,
                                              stripped, &disc);
@@ -468,7 +566,16 @@ static int cdq_install_c_hooks(IMP mainSym) {
             continue;
         }
 
-        g_origC[i] = stripped;   // original code, untouched (GOT rebind only)
+        // v1.3.0 THE FIX: g_origC must be callable. The compiler emits
+        // `blraaz x8` (IA key, ZERO modifier) for f(...) through fn_gen, so
+        // re-sign with exactly that and prove the round trip numerically.
+        void *signedOrig = ptrauth_sign_unauthenticated(stripped, ptrauth_key_asia, 0);
+        if (ptrauth_auth_data(signedOrig, ptrauth_key_asia, 0) != stripped) {
+            plog("REBIND [%d] %-26s MISS orig re-auth round-trip failed (fail-open)\n",
+                 i, kCSlots[i].name);
+            continue;
+        }
+        g_origC[i] = signedOrig;
         g_bound[i] = 1;
 
         vm_address_t page = (vm_address_t)((uintptr_t)slot & ~(uintptr_t)(pagesize - 1));
@@ -495,10 +602,10 @@ static int cdq_install_c_hooks(IMP mainSym) {
              kCSlots[i].action);
         ok++;
     }
-    plog("REBIND READY bound=%d/%d mode=%d (short-circuit=%s) "
+    plog("REBIND READY bound=%d/%d mode=%d guard=%d (short-circuit=%s) "
          "size0=_fast_size_directory,_traverse_directory,_traverse_dir_with_state "
-         "timed=framework-API passthrough (real PURGE kept)\n",
-         ok, CSLOT_COUNT, g_mode,
+         "timed=framework-API passthrough orig=PAC-signed(IA,mod0) (real PURGE kept)\n",
+         ok, CSLOT_COUNT, g_mode, g_guardTimedOff,
          (g_mode == MODE_QUIET || g_mode == MODE_STRICT) ? "YES" : "NO");
     return ok;
 #endif
@@ -613,10 +720,20 @@ __attribute__((constructor)) static void cdq_init(void) {
     else if (flag_exists("PASSTHROUGH_ALL")) g_mode = MODE_PASS;
 
     open_log();
-    plog("START %llu build=1.2.0 plan=D3 mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
+    plog("START %llu build=1.3.0 plan=D4 mode=%d pid=%d uid=%d proc=CacheDeleteAppContainerCaches "
          "log=%s errno=[%d,%d,%d,%d] logfd=%d\n",
          now_ms(), g_mode, (int)getpid(), (int)getuid(), g_logpath,
          g_openErrno[0], g_openErrno[1], g_openErrno[2], g_openErrno[3], g_logfd);
+
+    // v1.3.0: per-API kill switches, then the crash-loop breaker. The breaker
+    // only ever removes wrappers that call back into the framework.
+    for (int i = 0; i < CSLOT_COUNT; i++)
+        g_skipFlag[i] = (kCSlots[i].flag && flag_exists(kCSlots[i].flag)) ? 1 : 0;
+    g_guardTimedOff = cdq_guard_rapid_restart();
+    plog("GUARD rapid-restart=%d (4 starts/5min trips it; delete %s to re-arm)\n",
+         g_guardTimedOff, kStatePath);
+    plog("SKIPFLAGS itemized=%d enum=%d personas=%d largeapp=%d recent=%d\n",
+         g_skipFlag[0], g_skipFlag[1], g_skipFlag[4], g_skipFlag[5], g_skipFlag[6]);
 
     int ncls = objc_getClassList(NULL, 0);
     plog("DIAG classes=%d lsClass=%p cdcClass=%p tmpdir=%s\n",
